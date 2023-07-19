@@ -465,6 +465,7 @@ static void ATExecDropCluster(Relation rel, LOCKMODE lockmode);
 static void ATPrepSetAccessMethod(AlteredTableInfo *tab, Relation rel, const char *amname);
 static void ATExecSetAccessMethodNoStorage(Relation rel, Oid newAccessMethod);
 static bool ATPrepChangePersistence(Relation rel, bool toLogged);
+static void ATPrepRepack(Relation rel, AlterTableCmd *cmd);
 static void ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel,
 								const char *tablespacename, LOCKMODE lockmode);
 static void ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode);
@@ -501,6 +502,7 @@ static void RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid,
 											 Oid oldrelid, void *arg);
 
 static void ATExecExpandTable(List **wqueue, Relation rel, AlterTableCmd *cmd);
+static void ATRepackTable(List **wqueue, Relation rel, AlterTableCmd *cmd);
 static void ATExecExpandPartitionTablePrepare(Relation rel);
 static void ATExecExpandTableCTAS(AlterTableCmd *rootCmd, Relation rel, AlterTableCmd *cmd);
 
@@ -4753,7 +4755,9 @@ AlterTableGetLockLevel(List *cmds)
 			case AT_SetDistributedBy:
 				cmd_lockmode = AccessExclusiveLock;
 				break;
-
+			case AT_RepackTable: /* GPDB: REPACK TABLE */ 
+				cmd_lockmode = AccessExclusiveLock;
+				break;
 				/*
 				 * GPDB: For these commands lookup root partition to construct
 				 * the appropriate stmt. Hence, AccessShareLock should be
@@ -5211,7 +5215,14 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 			ATSimpleRecursion(wqueue, rel, cmd, recurse, lockmode);
 			pass = AT_PASS_MISC;
 			break;
+		case AT_RepackTable: /* GPDB: REPACK TABLE */
+			if (Gp_role == GP_ROLE_DISPATCH)
+				ATPrepRepack(rel, cmd);
 
+			ATSimplePermissions(rel, ATT_TABLE);
+			ATSimpleRecursion(wqueue, rel, cmd, recurse, lockmode);
+			pass = AT_PASS_MISC;
+			break;
 		case AT_ExpandPartitionTablePrepare:
 			ATSimplePermissions(rel, ATT_TABLE | ATT_FOREIGN_TABLE | ATT_MATVIEW);
 
@@ -5751,6 +5762,7 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		case AT_ExpandTable:	/* EXPAND TABLE */
 			ATExecExpandTable(wqueue, rel, cmd);
 			break;
+		case AT_RepackTable: 
 		case AT_ExpandPartitionTablePrepare:	/* EXPAND PARTITION PREPARE */
 			ATExecExpandPartitionTablePrepare(rel);
 			break;
@@ -5890,6 +5902,17 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("cannot rewrite temporary tables of other sessions")));
+		}
+
+		/*
+		 * If we are repacking an AO table, we do not want to invoke the full rewrite machinery.
+		 * Instead divert to a special handler that will perform the required operations
+		 */
+		if (tab->rewrite & AT_REWRITE_REPACK)
+		{
+			ATRepackTable(OldHeap, tab); // AJR TODO --  adjust signature here.  
+			// AJR TODO -- determine what other bookkeeping needs to be done here. notably
+			// finish_heap_swap seems likely 
 		}
 
 		/*
@@ -17325,6 +17348,23 @@ ATExecExpandTableCTAS(AlterTableCmd *rootCmd, Relation rel, AlterTableCmd *cmd)
 }
 
 /*
+ * ALTER TABLE REPACK BY
+ *
+ * reload an appendonly table to improve compression performance
+ */ 
+
+static void
+ATRepackTable(List **wqueue, Relation rel, AlterTableCmd *cmd)
+{
+	elog(WARNING, "AJR -- we landed in the repack function!");
+	bool is_co = false;
+
+	if (RelationIsAoCols(rel))
+		is_co = true;
+
+}
+
+/*
  * ALTER TABLE SET DISTRIBUTED BY
  *
  * set distribution policy for rel
@@ -18668,6 +18708,72 @@ ATPrepChangePersistence(Relation rel, bool toLogged)
 	table_close(pg_constraint, AccessShareLock);
 
 	return true;
+}
+
+/*
+ * Preparation phase for REPACK BY COLUMNS (...)
+ * Check for expected attributes of the table, error/warn as needed.
+ */
+static void
+ATPrepRepack(Relation rel, AlterTableCmd *cmd)
+{
+	List *cols = (List *) cmd->def;
+	List *reloptions;
+	ListCell   *cell;
+	bool foundCompression = false;
+
+
+	/*
+	 * Check whether relation is an appendonly table. If not, hard-fail the
+	 * statement.
+	 */
+	if (!RelationIsAppendOptimized(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot repack table \"%s\" because it is not append-optimized",
+						RelationGetRelationName(rel)),
+				 errtable(rel)));
+ 
+	/* 
+	 * Check whether the table has any compression.  If not, warn that
+	 * repacking won't be beneficial.
+	 */
+	reloptions = untransformRelOptions(get_rel_opts(rel));
+	foreach(cell, reloptions)
+	{
+		DefElem *def = lfirst(cell);
+		char *compressArg;
+		if (pg_strcasecmp(def->defname, "compresstype") == 0)
+		{
+			compressArg = defGetString(def);
+			if (pg_strcasecmp("none", compressArg) != 0)
+				foundCompression = true;
+		}
+	}
+	/* 
+	 * If we have not already fired a warning for the table, do a column level check for AOCO
+	 * tables, to check that all columns are compressed
+	 */
+	if (!foundCompression && RelationIsAoCols(rel))
+	{
+		foreach(cell, cols)
+		{
+			ColumnDef *col = lfirst(cell);
+			// AJR TODO -- where do we store column level compression info?
+			// it is in pg_attribute_encoding, look up how to retrieve that from here
+			ereport(WARNING,
+					(errmsg("AJR -- we have found column: \"%s\"",
+							col->colname)));
+		}
+	}
+
+	if (!foundCompression)
+	{
+		ereport(NOTICE,
+				(errmsg("table \"%s\" is not compressed",
+						RelationGetRelationName(rel)),
+				errdetail("repacking this table will not reduce disk space usage")));
+	}
 }
 
 /*
