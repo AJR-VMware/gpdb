@@ -75,6 +75,7 @@
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
 #include "commands/user.h"
+#include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "executor/instrument.h"
 #include "foreign/foreign.h"
@@ -115,6 +116,7 @@
 #include "utils/memutils.h"
 #include "utils/metrics_utils.h"
 #include "utils/partcache.h"
+#include "utils/pg_rusage.h"
 #include "utils/relcache.h"
 #include "utils/resgroup.h"
 #include "utils/ruleutils.h"
@@ -465,7 +467,7 @@ static void ATExecDropCluster(Relation rel, LOCKMODE lockmode);
 static void ATPrepSetAccessMethod(AlteredTableInfo *tab, Relation rel, const char *amname);
 static void ATExecSetAccessMethodNoStorage(Relation rel, Oid newAccessMethod);
 static bool ATPrepChangePersistence(Relation rel, bool toLogged);
-static void ATPrepRepack(Relation rel, AlterTableCmd *cmd);
+static void ATPrepRepack(Relation rel, List *cols);
 static void ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel,
 								const char *tablespacename, LOCKMODE lockmode);
 static void ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode);
@@ -502,7 +504,7 @@ static void RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid,
 											 Oid oldrelid, void *arg);
 
 static void ATExecExpandTable(List **wqueue, Relation rel, AlterTableCmd *cmd);
-static void ATRepackTable(List **wqueue, Relation rel, AlterTableCmd *cmd);
+static void ATRepackTable(Relation origTable, AlteredTableInfo *tab);
 static void ATExecExpandPartitionTablePrepare(Relation rel);
 static void ATExecExpandTableCTAS(AlterTableCmd *rootCmd, Relation rel, AlterTableCmd *cmd);
 
@@ -5216,11 +5218,16 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 			pass = AT_PASS_MISC;
 			break;
 		case AT_RepackTable: /* GPDB: REPACK TABLE */
-			if (Gp_role == GP_ROLE_DISPATCH)
-				ATPrepRepack(rel, cmd);
-
 			ATSimplePermissions(rel, ATT_TABLE);
 			ATSimpleRecursion(wqueue, rel, cmd, recurse, lockmode);
+
+			List *cols = (List *) cmd->def;
+
+			if (Gp_role == GP_ROLE_DISPATCH)
+				ATPrepRepack(rel, cols);
+
+			tab->rewrite |= AT_REWRITE_REPACK;
+			tab->repack_cols = cols; 
 			pass = AT_PASS_MISC;
 			break;
 		case AT_ExpandPartitionTablePrepare:
@@ -5911,8 +5918,8 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode)
 		if (tab->rewrite & AT_REWRITE_REPACK)
 		{
 			ATRepackTable(OldHeap, tab); // AJR TODO --  adjust signature here.  
-			// AJR TODO -- determine what other bookkeeping needs to be done here. notably
-			// finish_heap_swap seems likely 
+			heap_close(OldHeap, NoLock);
+			continue;
 		}
 
 		/*
@@ -17348,20 +17355,113 @@ ATExecExpandTableCTAS(AlterTableCmd *rootCmd, Relation rel, AlterTableCmd *cmd)
 }
 
 /*
- * ALTER TABLE REPACK BY
+ * ALTER TABLE REPACK BY COLUMNS (...)
+ * Reload an appendonly table to a physically sorted order on disk.
  *
- * reload an appendonly table to improve compression performance
- */ 
+ * This uses similar logic to CLUSTER, but does not rely on having an index
+ * in place. Further, we rely on the AT scaffolding to omit much of the
+ * checks and bookkeeping needed for CLUSTER and VACUUM.
+ */
 
 static void
-ATRepackTable(List **wqueue, Relation rel, AlterTableCmd *cmd)
+ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 {
 	elog(WARNING, "AJR -- we landed in the repack function!");
-	bool is_co = false;
 
-	if (RelationIsAoCols(rel))
-		is_co = true;
+	Oid		accessMethod = origTable->rd_rel->relam;
+	Oid		origTableOid = RelationGetRelid(origTable);
+	Oid		tableSpace = origTable->rd_rel->reltablespace;
+	char	relpersistence = origTable->rd_rel->relpersistence;
+	double	num_tuples = 0;
+	double	tups_recently_dead = 0;
+	double	tups_vacuumed = 0;
 
+
+	MultiXactId		cutoffMulti;
+	Oid				newTableOid;
+	Relation		dummyIndex;
+	Relation		newTable;
+	TransactionId	OldestXmin;
+	TransactionId	frozenXid;
+
+	/* 
+	 * Assume that origTable is an AO table, not a system relation, that a lock is held by
+	 * ATController, and that relation is already open.
+	 */ 
+
+	/* Create the transient table that will receive the re-ordered data */
+	newTableOid = make_new_heap(origTableOid, tableSpace,
+							   accessMethod, NULL,
+							   (Datum)0, /* newoptions */
+							   relpersistence,
+							   AccessExclusiveLock,
+							   true /* createAoBlockDirectory */,
+							   false);
+	
+	/* 
+	 * Perform the physical copy ofthe table.  We set up bookkeeping and then call out to the
+	 * appropriate AM functions
+	 */
+	newTable = table_open(newTableOid, AccessExclusiveLock);
+
+
+	// AJR TODO -- these steps already done in the ao AM handlers, so if we can re-use the copy for
+	// cluster code we don't need it here also
+	////////////////////////////////////////////////////
+	/*
+	 * Compute xids used to freeze and weed out dead tuples and multixacts.
+	 */
+	vacuum_set_xid_limits(origTable, 0, 0, 0, 0,
+						  &OldestXmin, &frozenXid, NULL, &cutoffMulti,
+						  NULL);
+
+	/*
+	 * frozenXid will become the table's new relfrozenxid, and that mustn't go
+	 * backwards, so take the max.
+	 */
+	if (TransactionIdIsValid(origTable->rd_rel->relfrozenxid) &&
+		TransactionIdPrecedes(frozenXid, origTable->rd_rel->relfrozenxid))
+		frozenXid = origTable->rd_rel->relfrozenxid;
+
+	/*
+	 * cutoffMulti, similarly, shouldn't go backwards either.
+	 */
+	if (MultiXactIdIsValid(origTable->rd_rel->relminmxid) &&
+		MultiXactIdPrecedes(cutoffMulti, origTable->rd_rel->relminmxid))
+		cutoffMulti = origTable->rd_rel->relminmxid;
+	////////////////////////////////////////////////////
+
+	ereport(DEBUG2, // AJR TODO -- not sure what the best log level here is
+		(errmsg("repacking \"%s.%s\"",
+			get_namespace_name(RelationGetNamespace(origTable)),
+			RelationGetRelationName(origTable))));
+
+	dummyIndex = dummy_index_create(origTable, tab->repack_cols);
+
+	// table_relation_copy_for_repack(origTable, newTable);
+	table_relation_copy_for_cluster(origTable, newTable, dummyIndex, 
+									false, // use_sort is not used in AORO or AOCS AM routines
+									OldestXmin, &frozenXid, &cutoffMulti,
+									&num_tuples, &tups_vacuumed,
+									&tups_recently_dead);
+
+	/* Make the update visible */
+	CommandCounterIncrement();
+
+	/*
+	 * Swap the physical files of the target and transient tables, then
+	 * rebuild the target's indexes and throw away the transient table.
+	 */
+	finish_heap_swap(origTableOid, newTableOid, 
+		false, /* is not a system catalog */
+		false, /* AO tables do not have TOAST */
+		true /* swap_stats */,
+		false, 
+		true,
+		frozenXid, cutoffMulti,
+		relpersistence);
+
+	// RelationCacheDelete(dummyIndex); // AJR TODO
 }
 
 /*
@@ -18715,13 +18815,17 @@ ATPrepChangePersistence(Relation rel, bool toLogged)
  * Check for expected attributes of the table, error/warn as needed.
  */
 static void
-ATPrepRepack(Relation rel, AlterTableCmd *cmd)
+ATPrepRepack(Relation rel, List * cols)
 {
-	List *cols = (List *) cmd->def;
 	List *reloptions;
 	ListCell   *cell;
 	bool foundCompression = false;
 
+	if (!(list_length(cols) > 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot repack table without at least one COLUMN specified"),
+				 errtable(rel)));
 
 	/*
 	 * Check whether relation is an appendonly table. If not, hard-fail the

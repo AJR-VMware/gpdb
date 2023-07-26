@@ -564,6 +564,10 @@ typedef struct TableAmRoutine
 											  double *tups_vacuumed,
 											  double *tups_recently_dead);
 
+	/* See table_relation_copy_for_repack() */
+	void		(*relation_copy_for_repack) (Relation origTable,
+											  Relation newTable);
+									 
 	/*
 	 * React to VACUUM command on the relation. The VACUUM can be
 	 * triggered by a user or by autovacuum. The specific actions
@@ -1643,6 +1647,12 @@ table_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 													xid_cutoff, multi_cutoff,
 													num_tuples, tups_vacuumed,
 													tups_recently_dead);
+}
+
+static inline void
+table_relation_copy_for_repack(Relation origTable, Relation newTable)
+{
+	origTable->rd_tableam->relation_copy_for_repack(origTable, newTable);
 }
 
 /*

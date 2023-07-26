@@ -165,6 +165,7 @@ extern void RestoreReindexState(void *reindexstate);
 
 extern void IndexSetParentIndex(Relation idx, Oid parentOid);
 extern bool IsIndexOnAORel(Relation idx);
+extern Relation dummy_index_create(Relation origTable, List *cols);
 
 
 /*

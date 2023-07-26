@@ -1167,6 +1167,35 @@ appendonly_relation_rewrite_columns(Relation rel, List *newvals, TupleDesc oldDe
 }
 
 static void
+appendonly_relation_copy_for_repack(Relation origTable, Relation newTable)
+{
+	PGRUsage		ru0;
+	TupleDesc		origTupDesc;
+	TupleDesc		newTupDesc;
+	int				natts;
+	Datum			*values;
+	bool			*isnull;
+	Tuplesortstate	*tuplesort;
+	Relation		OldIndex = NULL;	
+
+
+	pg_rusage_init(&ru0);
+	origTupDesc = RelationGetDescr(origTable);
+	newTupDesc = RelationGetDescr(newTable);
+
+
+	/* Preallocate values/isnull arrays to deform heap tuples after sort */
+	natts = newTupDesc->natts;
+	values = (Datum *) palloc(natts * sizeof(Datum));
+	isnull = (bool *) palloc(natts * sizeof(bool));
+
+	// AJR TODO -- passing a null OldIndex here will not work. figure it out
+	tuplesort = tuplesort_begin_cluster(origTupDesc, OldIndex,
+											maintenance_work_mem, NULL, false);
+
+}
+
+static void
 appendonly_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 								 Relation OldIndex, bool use_sort,
 								 TransactionId OldestXmin,
@@ -2289,6 +2318,7 @@ static const TableAmRoutine ao_row_methods = {
 	.relation_set_new_filenode = appendonly_relation_set_new_filenode,
 	.relation_nontransactional_truncate = appendonly_relation_nontransactional_truncate,
 	.relation_copy_data = appendonly_relation_copy_data,
+	.relation_copy_for_repack = appendonly_relation_copy_for_repack,
 	.relation_copy_for_cluster = appendonly_relation_copy_for_cluster,
 	.relation_add_columns = appendonly_relation_add_columns,
 	.relation_rewrite_columns = appendonly_relation_rewrite_columns,

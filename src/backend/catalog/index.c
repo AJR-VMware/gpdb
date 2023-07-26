@@ -21,6 +21,8 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_class_d.h"
 #include "postgres.h"
 
 #include <unistd.h>
@@ -58,6 +60,7 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
@@ -70,6 +73,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/parser.h"
 #include "pgstat.h"
+#include "postgres_ext.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -85,6 +89,7 @@
 #include "utils/pg_rusage.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/relcache.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 #include "utils/snapmgr.h"
@@ -689,6 +694,98 @@ UpdateIndexRelation(Oid indexoid,
 	heap_freetuple(tuple);
 }
 
+
+/* 
+ * To support using tuplesort for REPACK, we require a dummy index to provide 
+ * ordering information.  We pretend a BTREE index, with keys matching the columns provided in the
+ * REPACK BY statement. We populate only the struct members that are needed for repacking.
+ */
+Relation
+dummy_index_create(Relation origTable, List *cols)
+{
+	IndexInfo	*indexInfo;
+	List		*colnames;
+	ListCell	*cell;
+	Oid			*classObjectId;
+	Oid			*collationObjectId;
+	Oid			*typeObjectId;
+	Relation	dummyIndex;
+	TupleDesc	dummyTupleDesc; 
+	TupleDesc	origTupleDesc;
+	int keyNo;
+	int16		*coloptions;
+
+	int keyCount = list_length(cols);
+
+	typeObjectId = (Oid *) palloc(keyCount * sizeof(Oid));
+	collationObjectId = (Oid *) palloc(keyCount * sizeof(Oid));
+	classObjectId = (Oid *) palloc(keyCount * sizeof(Oid));
+	coloptions = (int16 *) palloc(keyCount * sizeof(int16));
+
+	origTupleDesc = RelationGetDescr(origTable);
+
+	keyNo = 0;
+	foreach(cell, cols)
+	{
+		HeapTuple tup;
+		Form_pg_attribute 	attTup;
+
+		ColumnDef *col = lfirst(cell);
+		colnames = lappend(colnames, col->colname);
+
+					
+		/* Find the column tuple so we can extract its required fields */
+		tup = SearchSysCacheAttName(RelationGetRelid(origTable), col->colname);
+		if (!HeapTupleIsValid(tup))
+			ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_COLUMN),
+			errmsg("column \"%s\" of relation \"%s\" does not exist",
+			col->colname, RelationGetRelationName(origTable))));
+
+		attTup = (Form_pg_attribute) GETSTRUCT(tup);
+		typeObjectId[keyNo] = attTup->atttypid;
+		collationObjectId[keyNo] = attTup->attcollation;
+		classObjectId[keyNo] = ResolveOpClass(
+			NIL, /* default opclass for repacking */
+			attTup->atttypid,
+			"btree", /* Lie to placate CLUSTER */
+			BTREE_AM_OID); /* Lie to placate CLUSTER */
+
+		keyNo++;
+	}
+
+	indexInfo = makeIndexInfo(keyCount,
+		keyCount,
+		BTREE_AM_OID, /* lie here to placate CLUSTER */
+		NIL,
+		NIL, //AJR TODO -- this is for predicates.  not sure NIL will work
+		false,
+		true,
+		false);
+
+	dummyTupleDesc = ConstructTupleDescriptor(
+		origTable,
+		indexInfo,
+		colnames,
+		BTREE_AM_OID, /* lie here to placate CLUSTER */
+		collationObjectId,
+		classObjectId);
+
+	dummyIndex = RelationBuildLocalRelation(
+		"repack_dummy_index",
+		InvalidOid, // AJR TODO -- not sure how forgiving this is, try with junk for now
+		dummyTupleDesc,
+		InvalidOid, // AJR TODO -- not sure how forgiving this is, try with junk for now
+		BTREE_AM_OID, /* lie here to placate CLUSTER */
+		InvalidOid, // AJR TODO -- not sure how forgiving this is, try with junk for now
+		InvalidOid, // AJR TODO -- not sure how forgiving this is, try with junk for now
+		false,
+		false,
+		RELPERSISTENCE_TEMP,
+		RELKIND_INDEX);
+
+	return dummyIndex;
+}
 
 /*
  * index_create
