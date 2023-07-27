@@ -21,8 +21,6 @@
  *
  *-------------------------------------------------------------------------
  */
-#include "catalog/pg_am_d.h"
-#include "catalog/pg_class_d.h"
 #include "postgres.h"
 
 #include <unistd.h>
@@ -48,6 +46,9 @@
 #include "catalog/objectaccess.h"
 #include "catalog/partition.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_class_d.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_description.h"
@@ -704,7 +705,6 @@ Relation
 dummy_index_create(Relation origTable, List *cols)
 {
 	IndexInfo	*indexInfo;
-	List		*colnames;
 	ListCell	*cell;
 	Oid			*classObjectId;
 	Oid			*collationObjectId;
@@ -712,29 +712,39 @@ dummy_index_create(Relation origTable, List *cols)
 	Relation	dummyIndex;
 	TupleDesc	dummyTupleDesc; 
 	TupleDesc	origTupleDesc;
-	int keyNo;
+	int			keyNo;
 	int16		*coloptions;
 
-	int keyCount = list_length(cols);
+	List *colnames = NIL;
+	int colCount = list_length(cols);
 
-	typeObjectId = (Oid *) palloc(keyCount * sizeof(Oid));
-	collationObjectId = (Oid *) palloc(keyCount * sizeof(Oid));
-	classObjectId = (Oid *) palloc(keyCount * sizeof(Oid));
-	coloptions = (int16 *) palloc(keyCount * sizeof(int16));
+	typeObjectId = (Oid *) palloc0(colCount * sizeof(Oid));
+	collationObjectId = (Oid *) palloc0(colCount * sizeof(Oid));
+	classObjectId = (Oid *) palloc0(colCount * sizeof(Oid));
+	coloptions = (int16 *) palloc0(colCount * sizeof(int16));
 
 	origTupleDesc = RelationGetDescr(origTable);
+
+	indexInfo = makeIndexInfo(
+		colCount,
+		colCount,
+		BTREE_AM_OID, /* lie here to placate CLUSTER */
+		NIL,
+		NIL, // AJR TODO -- this is for predicates.  not sure NIL will work
+		false,
+		true,
+		false);
 
 	keyNo = 0;
 	foreach(cell, cols)
 	{
-		HeapTuple tup;
+		HeapTuple			tup;
 		Form_pg_attribute 	attTup;
-
 		ColumnDef *col = lfirst(cell);
-		colnames = lappend(colnames, col->colname);
 
+		colnames = lappend(colnames, pstrdup(col->colname));
 					
-		/* Find the column tuple so we can extract its required fields */
+		/* Find and cast the column tuple so we can extract its required fields */
 		tup = SearchSysCacheAttName(RelationGetRelid(origTable), col->colname);
 		if (!HeapTupleIsValid(tup))
 			ereport(ERROR,
@@ -743,25 +753,26 @@ dummy_index_create(Relation origTable, List *cols)
 			col->colname, RelationGetRelationName(origTable))));
 
 		attTup = (Form_pg_attribute) GETSTRUCT(tup);
+
+		/* load up the various information collections we need downstream */
 		typeObjectId[keyNo] = attTup->atttypid;
-		collationObjectId[keyNo] = attTup->attcollation;
+		indexInfo->ii_IndexAttrNumbers[keyNo] = attTup->attnum;
+
+		if (OidIsValid(attTup->attcollation))
+			collationObjectId[keyNo] = attTup->attcollation;
+		else
+			collationObjectId[keyNo] = DEFAULT_COLLATION_OID; // this segfaults
+
 		classObjectId[keyNo] = ResolveOpClass(
 			NIL, /* default opclass for repacking */
 			attTup->atttypid,
 			"btree", /* Lie to placate CLUSTER */
 			BTREE_AM_OID); /* Lie to placate CLUSTER */
 
+
+		ReleaseSysCache(tup);
 		keyNo++;
 	}
-
-	indexInfo = makeIndexInfo(keyCount,
-		keyCount,
-		BTREE_AM_OID, /* lie here to placate CLUSTER */
-		NIL,
-		NIL, //AJR TODO -- this is for predicates.  not sure NIL will work
-		false,
-		true,
-		false);
 
 	dummyTupleDesc = ConstructTupleDescriptor(
 		origTable,
@@ -771,19 +782,67 @@ dummy_index_create(Relation origTable, List *cols)
 		collationObjectId,
 		classObjectId);
 
-	dummyIndex = RelationBuildLocalRelation(
-		"repack_dummy_index",
-		InvalidOid, // AJR TODO -- not sure how forgiving this is, try with junk for now
-		dummyTupleDesc,
-		InvalidOid, // AJR TODO -- not sure how forgiving this is, try with junk for now
-		BTREE_AM_OID, /* lie here to placate CLUSTER */
-		InvalidOid, // AJR TODO -- not sure how forgiving this is, try with junk for now
-		InvalidOid, // AJR TODO -- not sure how forgiving this is, try with junk for now
-		false,
-		false,
-		RELPERSISTENCE_TEMP,
-		RELKIND_INDEX);
+	/* now, manually populate the Relation struct for the dummy index */
+	dummyIndex = (Relation) palloc0(sizeof(RelationData));
+	dummyIndex->rd_smgr = NULL;
+	dummyIndex->rd_isnailed = false;
+	dummyIndex->rd_refcnt = 0;
+	dummyIndex->rd_createSubid = GetCurrentSubTransactionId();
+	dummyIndex->rd_newRelfilenodeSubid = InvalidSubTransactionId;
+    dummyIndex->rd_att = dummyTupleDesc;
+    dummyIndex->rd_att->tdrefcount = 1;
 
+	dummyIndex->rd_rel = (Form_pg_class) palloc0(CLASS_TUPLE_SIZE);
+	namestrcpy(&dummyIndex->rd_rel->relname, "repack_dummy_index");
+	dummyIndex->rd_rel->relnamespace = origTable->rd_rel->relnamespace;
+	dummyIndex->rd_rel->relkind = RELKIND_INDEX;
+	dummyIndex->rd_rel->relnatts = colCount;
+	dummyIndex->rd_rel->reltype = InvalidOid;
+	dummyIndex->rd_rel->relowner = BOOTSTRAP_SUPERUSERID;
+	dummyIndex->rd_rel->relpersistence = RELPERSISTENCE_TEMP;
+	dummyIndex->rd_backend = BackendIdForTempRelations();
+	dummyIndex->rd_islocaltemp = true;
+	dummyIndex->rd_rel->relispopulated = true;
+	dummyIndex->rd_rel->relreplident = REPLICA_IDENTITY_NOTHING;
+	dummyIndex->rd_rel->relisshared = false;
+	dummyIndex->rd_id = InvalidOid;
+
+	dummyIndex->rd_index = (Form_pg_index) palloc0(INDEX_TUPLE_SIZE);
+	dummyIndex->rd_index->indexrelid = InvalidOid;
+	dummyIndex->rd_index->indrelid = origTable->rd_id;
+	dummyIndex->rd_index->indnatts = colCount;
+	dummyIndex->rd_index->indnkeyatts = colCount;
+	dummyIndex->rd_index->indisunique = false;
+	dummyIndex->rd_index->indisprimary = false;
+	dummyIndex->rd_index->indisexclusion = false;
+	dummyIndex->rd_index->indimmediate = false;
+	dummyIndex->rd_index->indisclustered = false;
+	dummyIndex->rd_index->indisvalid = false;
+	dummyIndex->rd_index->indcheckxmin = false;
+	dummyIndex->rd_index->indisready = false;
+	dummyIndex->rd_index->indislive = false;
+	dummyIndex->rd_index->indisreplident = false;
+
+
+	for (int i = 0; i < colCount; i++)
+		TupleDescAttr(dummyIndex->rd_att, i)->attrelid = InvalidOid;
+
+	dummyIndex->rd_rel->reltablespace = origTable->rd_rel->reltablespace;
+	dummyIndex->rd_rel->relfilenode = InvalidOid;
+	dummyIndex->rd_rel->relam = BTREE_AM_OID;
+	dummyIndex->rd_isvalid = true;
+
+
+	// AJR -- is it worth doing this explicitly, or should we allow context cleanup to handle this?
+	list_free_deep(colnames);
+	colnames = NIL;
+	pfree(typeObjectId);
+	pfree(collationObjectId);
+	pfree(classObjectId);
+	pfree(coloptions);
+	pfree(dummyIndex->rd_rel);
+	pfree(dummyIndex->rd_index);
+	pfree(dummyIndex);
 	return dummyIndex;
 }
 

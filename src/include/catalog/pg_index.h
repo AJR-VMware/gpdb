@@ -71,6 +71,10 @@ FOREIGN_KEY(indrelid REFERENCES pg_class(oid));
  */
 typedef FormData_pg_index *Form_pg_index;
 
+/* Size of fixed part of pg_index tuples, not counting var-length fields */
+#define INDEX_TUPLE_SIZE \
+	 (offsetof(FormData_pg_index,indisreplident) + sizeof(bool))
+
 #ifdef EXPOSE_TO_CLIENT_CODE
 
 /*
