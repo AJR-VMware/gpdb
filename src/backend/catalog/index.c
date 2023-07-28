@@ -704,16 +704,16 @@ UpdateIndexRelation(Oid indexoid,
 Relation
 dummy_index_create(Relation origTable, List *cols)
 {
-	IndexInfo	*indexInfo;
-	ListCell	*cell;
-	Oid			*classObjectId;
-	Oid			*collationObjectId;
-	Oid			*typeObjectId;
-	Relation	dummyIndex;
-	TupleDesc	dummyTupleDesc; 
-	TupleDesc	origTupleDesc;
-	int			keyNo;
-	int16		*coloptions;
+	IndexInfo		*indexInfo;
+	ListCell		*cell;
+	Oid				*classObjectId;
+	Oid				*collationObjectId;
+	Oid				*typeObjectId;
+	Relation		dummyIndex;
+	TupleDesc		dummyTupleDesc; 
+	TupleDesc		origTupleDesc;
+	int				keyNo;
+	int16			*coloptions;
 
 	List *colnames = NIL;
 	int colCount = list_length(cols);
@@ -807,6 +807,14 @@ dummy_index_create(Relation origTable, List *cols)
 	dummyIndex->rd_rel->relisshared = false;
 	dummyIndex->rd_id = InvalidOid;
 
+	for (int i = 0; i < colCount; i++)
+		TupleDescAttr(dummyIndex->rd_att, i)->attrelid = InvalidOid;
+
+	dummyIndex->rd_rel->reltablespace = origTable->rd_rel->reltablespace;
+	dummyIndex->rd_rel->relfilenode = InvalidOid;
+	dummyIndex->rd_rel->relam = BTREE_AM_OID;
+	dummyIndex->rd_isvalid = true;
+
 	dummyIndex->rd_index = (Form_pg_index) palloc0(INDEX_TUPLE_SIZE);
 	dummyIndex->rd_index->indexrelid = InvalidOid;
 	dummyIndex->rd_index->indrelid = origTable->rd_id;
@@ -823,17 +831,21 @@ dummy_index_create(Relation origTable, List *cols)
 	dummyIndex->rd_index->indislive = false;
 	dummyIndex->rd_index->indisreplident = false;
 
+	HeapTuple tuple;
+	Form_pg_am aform;
 
-	for (int i = 0; i < colCount; i++)
-		TupleDescAttr(dummyIndex->rd_att, i)->attrelid = InvalidOid;
+	dummyIndex->rd_indam = GetIndexAmRoutineByAmId(BTREE_AM_OID, false);
+	tuple = SearchSysCache1(AMOID, ObjectIdGetDatum(BTREE_AM_OID));
+	aform = (Form_pg_am) GETSTRUCT(tuple);
+	dummyIndex->rd_amhandler = aform->amhandler;
 
-	dummyIndex->rd_rel->reltablespace = origTable->rd_rel->reltablespace;
-	dummyIndex->rd_rel->relfilenode = InvalidOid;
-	dummyIndex->rd_rel->relam = BTREE_AM_OID;
-	dummyIndex->rd_isvalid = true;
+	dummyIndex->rd_support = (RegProcedure *) palloc0(dummyIndex->rd_indam->amsupport * colCount * sizeof(RegProcedure));
+	dummyIndex->rd_supportinfo = (FmgrInfo *) palloc0(dummyIndex->rd_indam->amsupport * colCount * sizeof(FmgrInfo));
+	// reference IndexSupportInitialize to see how to load these things
 
 
 	// AJR -- is it worth doing this explicitly, or should we allow context cleanup to handle this?
+	ReleaseSysCache(tuple);
 	list_free_deep(colnames);
 	colnames = NIL;
 	pfree(typeObjectId);
@@ -842,6 +854,8 @@ dummy_index_create(Relation origTable, List *cols)
 	pfree(coloptions);
 	pfree(dummyIndex->rd_rel);
 	pfree(dummyIndex->rd_index);
+	pfree(dummyIndex->rd_support);
+	pfree(dummyIndex->rd_supportinfo);
 	pfree(dummyIndex);
 	return dummyIndex;
 }
