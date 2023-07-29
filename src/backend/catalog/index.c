@@ -704,8 +704,13 @@ UpdateIndexRelation(Oid indexoid,
 Relation
 dummy_index_create(Relation origTable, List *cols)
 {
+	Form_pg_am		aform;
+	int				nsupport;
+	HeapTuple		tuple;
+	IndexAmRoutine	*amroutine;
 	IndexInfo		*indexInfo;
 	ListCell		*cell;
+	MemoryContext	indexcxt;
 	Oid				*classObjectId;
 	Oid				*collationObjectId;
 	Oid				*typeObjectId;
@@ -713,7 +718,6 @@ dummy_index_create(Relation origTable, List *cols)
 	TupleDesc		dummyTupleDesc; 
 	TupleDesc		origTupleDesc;
 	int				keyNo;
-	int16			*coloptions;
 
 	List *colnames = NIL;
 	int colCount = list_length(cols);
@@ -721,7 +725,6 @@ dummy_index_create(Relation origTable, List *cols)
 	typeObjectId = (Oid *) palloc0(colCount * sizeof(Oid));
 	collationObjectId = (Oid *) palloc0(colCount * sizeof(Oid));
 	classObjectId = (Oid *) palloc0(colCount * sizeof(Oid));
-	coloptions = (int16 *) palloc0(colCount * sizeof(int16));
 
 	origTupleDesc = RelationGetDescr(origTable);
 
@@ -730,47 +733,110 @@ dummy_index_create(Relation origTable, List *cols)
 		colCount,
 		BTREE_AM_OID, /* lie here to placate CLUSTER */
 		NIL,
-		NIL, // AJR TODO -- this is for predicates.  not sure NIL will work
+		NIL,
 		false,
 		true,
 		false);
 
+	/* 
+	 * We populate some of the Relation struct fields up front to allocate memory
+	 * and required fields so that we can then capture all desired per-column
+	 * information in a single loop through the user-provided columns
+	 */
+
+	/* populate the rd_indam Form_pg_am struct for the dummy index */
+	dummyIndex = (Relation) palloc0(sizeof(RelationData));
+	dummyIndex->rd_indam = GetIndexAmRoutineByAmId(BTREE_AM_OID, false);
+	tuple = SearchSysCache1(AMOID, ObjectIdGetDatum(BTREE_AM_OID));
+	aform = (Form_pg_am) GETSTRUCT(tuple);
+	dummyIndex->rd_amhandler = aform->amhandler;
+	ReleaseSysCache(tuple);
+
+	/*
+	 * Make the private context to hold index access info.  The reason we need
+	 * a context, and not just a couple of pallocs, is so that we won't leak
+	 * any subsidiary info attached to fmgr lookup records.
+	 */
+	indexcxt = AllocSetContextCreate(
+		CurrentMemoryContext,
+		"index info",
+		ALLOCSET_SMALL_SIZES);
+	dummyIndex->rd_indexcxt = indexcxt;
+	MemoryContextSetIdentifier(indexcxt,"repack_dummy_index");
+
+	/* 
+	 * allocate memory for the rd_support, rd_support, and rd_indcollation info
+	 * arrays of structs
+	 */
+	amroutine = GetIndexAmRoutine(dummyIndex->rd_amhandler);
+	nsupport = colCount * dummyIndex->rd_indam->amsupport;
+	dummyIndex->rd_support = (RegProcedure *) MemoryContextAllocZero(
+		indexcxt, nsupport * sizeof(RegProcedure));
+	dummyIndex->rd_supportinfo = (FmgrInfo *) MemoryContextAllocZero(
+		indexcxt, nsupport * sizeof(FmgrInfo));
+	dummyIndex->rd_indcollation = (Oid *) MemoryContextAllocZero(
+		indexcxt, colCount * sizeof(Oid));
+
+	/* Extract per-column info from user-provided columns, store to usable structs */
 	keyNo = 0;
 	foreach(cell, cols)
 	{
-		HeapTuple			tup;
 		Form_pg_attribute 	attTup;
+		Form_pg_opclass		opform;
+		HeapTuple			opClassTup;
+		HeapTuple			attHeapTup;
+		Oid					opClassId;
+
 		ColumnDef *col = lfirst(cell);
 
 		colnames = lappend(colnames, pstrdup(col->colname));
 					
 		/* Find and cast the column tuple so we can extract its required fields */
-		tup = SearchSysCacheAttName(RelationGetRelid(origTable), col->colname);
-		if (!HeapTupleIsValid(tup))
+		attHeapTup = SearchSysCacheAttName(RelationGetRelid(origTable), col->colname);
+		if (!HeapTupleIsValid(attHeapTup))
 			ereport(ERROR,
 			(errcode(ERRCODE_UNDEFINED_COLUMN),
 			errmsg("column \"%s\" of relation \"%s\" does not exist",
 			col->colname, RelationGetRelationName(origTable))));
 
-		attTup = (Form_pg_attribute) GETSTRUCT(tup);
+		attTup = (Form_pg_attribute) GETSTRUCT(attHeapTup);
 
 		/* load up the various information collections we need downstream */
 		typeObjectId[keyNo] = attTup->atttypid;
 		indexInfo->ii_IndexAttrNumbers[keyNo] = attTup->attnum;
 
 		if (OidIsValid(attTup->attcollation))
+		{
 			collationObjectId[keyNo] = attTup->attcollation;
+			dummyIndex->rd_indcollation[keyNo] = attTup->attcollation;
+		}
 		else
-			collationObjectId[keyNo] = DEFAULT_COLLATION_OID; // this segfaults
+		{
+			collationObjectId[keyNo] = DEFAULT_COLLATION_OID;
+			dummyIndex->rd_indcollation[keyNo] = DEFAULT_COLLATION_OID;
+		}
 
-		classObjectId[keyNo] = ResolveOpClass(
+		opClassId = ResolveOpClass(
 			NIL, /* default opclass for repacking */
 			attTup->atttypid,
-			"btree", /* Lie to placate CLUSTER */
-			BTREE_AM_OID); /* Lie to placate CLUSTER */
+			"btree", /* lie to placate CLUSTER */
+			BTREE_AM_OID); /* lie to placate CLUSTER */
 
+		classObjectId[keyNo] = opClassId;
+		opClassTup = SearchSysCache1(CLAOID, ObjectIdGetDatum(opClassId));
+		opform = (Form_pg_opclass) GETSTRUCT(opClassTup);
 
-		ReleaseSysCache(tup);
+		dummyIndex->rd_opfamily[keyNo] = opform->opcfamily;
+		dummyIndex->rd_opcintype[keyNo] = opform->opcintype;
+		dummyIndex->rd_support[keyNo * dummyIndex->rd_indam->amsupport] = 1; // how to retrieve this is still unclear.  relcache has IndexSupportInitialize
+		// needed by index_getprocinfo
+
+		// memcpy(&dummyIndex->rd_support[keyNo * dummyIndex->rd_indam->amsupport],
+		// 	opform->supportProcs, // this is what we want, but retrieving it requires a static relcache routine and it's not used anywhere?
+		// 	dummyIndex->rd_indam->amsupport * sizeof(RegProcedure));
+
+		ReleaseSysCache(attHeapTup);
+		ReleaseSysCache(opClassTup);
 		keyNo++;
 	}
 
@@ -782,8 +848,7 @@ dummy_index_create(Relation origTable, List *cols)
 		collationObjectId,
 		classObjectId);
 
-	/* now, manually populate the Relation struct for the dummy index */
-	dummyIndex = (Relation) palloc0(sizeof(RelationData));
+	/* manually populate the main Relation struct */
 	dummyIndex->rd_smgr = NULL;
 	dummyIndex->rd_isnailed = false;
 	dummyIndex->rd_refcnt = 0;
@@ -792,6 +857,7 @@ dummy_index_create(Relation origTable, List *cols)
     dummyIndex->rd_att = dummyTupleDesc;
     dummyIndex->rd_att->tdrefcount = 1;
 
+	/* manually populate the rd_rel Form_pg_class struct for the dummy index */
 	dummyIndex->rd_rel = (Form_pg_class) palloc0(CLASS_TUPLE_SIZE);
 	namestrcpy(&dummyIndex->rd_rel->relname, "repack_dummy_index");
 	dummyIndex->rd_rel->relnamespace = origTable->rd_rel->relnamespace;
@@ -815,6 +881,7 @@ dummy_index_create(Relation origTable, List *cols)
 	dummyIndex->rd_rel->relam = BTREE_AM_OID;
 	dummyIndex->rd_isvalid = true;
 
+	/* manually populate the rd_index Form_pg_index struct for the dummy index */
 	dummyIndex->rd_index = (Form_pg_index) palloc0(INDEX_TUPLE_SIZE);
 	dummyIndex->rd_index->indexrelid = InvalidOid;
 	dummyIndex->rd_index->indrelid = origTable->rd_id;
@@ -831,32 +898,17 @@ dummy_index_create(Relation origTable, List *cols)
 	dummyIndex->rd_index->indislive = false;
 	dummyIndex->rd_index->indisreplident = false;
 
-	HeapTuple tuple;
-	Form_pg_am aform;
+	// not sure if we need this
+	/* populate the rd_indoption array of ints for the dummy index */
+	// dummyIndex->rd_indoption = (int16 *) MemoryContextAllocZero(indexcxt, colCount * sizeof(int16));
+	// reference  to see how to load these things
 
-	dummyIndex->rd_indam = GetIndexAmRoutineByAmId(BTREE_AM_OID, false);
-	tuple = SearchSysCache1(AMOID, ObjectIdGetDatum(BTREE_AM_OID));
-	aform = (Form_pg_am) GETSTRUCT(tuple);
-	dummyIndex->rd_amhandler = aform->amhandler;
-
-	dummyIndex->rd_support = (RegProcedure *) palloc0(dummyIndex->rd_indam->amsupport * colCount * sizeof(RegProcedure));
-	dummyIndex->rd_supportinfo = (FmgrInfo *) palloc0(dummyIndex->rd_indam->amsupport * colCount * sizeof(FmgrInfo));
-	// reference IndexSupportInitialize to see how to load these things
-
-
-	// AJR -- is it worth doing this explicitly, or should we allow context cleanup to handle this?
-	ReleaseSysCache(tuple);
+	// is it worth doing this explicitly, or should we allow context cleanup to handle this?
 	list_free_deep(colnames);
 	colnames = NIL;
 	pfree(typeObjectId);
 	pfree(collationObjectId);
 	pfree(classObjectId);
-	pfree(coloptions);
-	pfree(dummyIndex->rd_rel);
-	pfree(dummyIndex->rd_index);
-	pfree(dummyIndex->rd_support);
-	pfree(dummyIndex->rd_supportinfo);
-	pfree(dummyIndex);
 	return dummyIndex;
 }
 

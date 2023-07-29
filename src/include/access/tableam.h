@@ -19,6 +19,7 @@
 
 #include "access/relscan.h"
 #include "access/sdir.h"
+#include "c.h"
 #include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/snapshot.h"
@@ -566,7 +567,16 @@ typedef struct TableAmRoutine
 
 	/* See table_relation_copy_for_repack() */
 	void		(*relation_copy_for_repack) (Relation origTable,
-											  Relation newTable);
+											 Relation newTable,
+											 int nkeys,
+											 AttrNumber *attNums,
+											 Oid *sortOperators,
+											 Oid *sortCollations,
+											 bool *nullsFirstFlags, 
+											 TransactionId *xid_cutoff,
+											 MultiXactId *multi_cutoff,
+											 TransactionId OldestXmin,
+											 double *num_tuples);
 									 
 	/*
 	 * React to VACUUM command on the relation. The VACUUM can be
@@ -1650,9 +1660,20 @@ table_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 }
 
 static inline void
-table_relation_copy_for_repack(Relation origTable, Relation newTable)
+table_relation_copy_for_repack(Relation origTable, Relation newTable, 
+	int nkeys, AttrNumber *attNums, Oid *sortOperators, Oid *sortCollations,
+	bool *nullsFirstFlags, TransactionId *xid_cutoff,
+	MultiXactId *multi_cutoff, TransactionId OldestXmin, double *num_tuples)
 {
-	origTable->rd_tableam->relation_copy_for_repack(origTable, newTable);
+	origTable->rd_tableam->relation_copy_for_repack(origTable, newTable, 
+													nkeys, attNums, 
+													sortOperators, 
+													sortCollations,
+													nullsFirstFlags,
+													xid_cutoff,
+													multi_cutoff,
+													OldestXmin,
+													num_tuples);
 }
 
 /*

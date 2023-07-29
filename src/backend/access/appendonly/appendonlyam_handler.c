@@ -14,6 +14,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "c.h"
 #include "postgres.h"
 
 #include "access/aomd.h"
@@ -29,6 +30,7 @@
 #include "catalog/index.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_appendonly.h"
+#include "catalog/pg_type.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "cdb/cdbappendonlyam.h"
@@ -43,6 +45,7 @@
 #include "utils/lsyscache.h"
 #include "utils/pg_rusage.h"
 #include "utils/sampling.h"
+#include "utils/tuplesort.h"
 
 #define IS_BTREE(r) ((r)->rd_rel->relam == BTREE_AM_OID)
 
@@ -1167,85 +1170,31 @@ appendonly_relation_rewrite_columns(Relation rel, List *newvals, TupleDesc oldDe
 }
 
 static void
-appendonly_relation_copy_for_repack(Relation origTable, Relation newTable)
+appendonly_relation_copy(Relation OldHeap, Relation NewHeap, TupleDesc oldTupDesc, 
+						 TransactionId OldestXmin, TransactionId *xid_cutoff,
+						 MultiXactId *multi_cutoff, double *num_tuples,
+						 double *tups_vacuumed, double *tups_recently_dead, 
+						 Tuplesortstate *tuplesort)
 {
-	PGRUsage		ru0;
-	TupleDesc		origTupDesc;
-	TupleDesc		newTupDesc;
-	int				natts;
-	Datum			*values;
-	bool			*isnull;
-	Tuplesortstate	*tuplesort;
-	Relation		OldIndex = NULL;	
-
-
-	pg_rusage_init(&ru0);
-	origTupDesc = RelationGetDescr(origTable);
-	newTupDesc = RelationGetDescr(newTable);
-
-
-	/* Preallocate values/isnull arrays to deform heap tuples after sort */
-	natts = newTupDesc->natts;
-	values = (Datum *) palloc(natts * sizeof(Datum));
-	isnull = (bool *) palloc(natts * sizeof(bool));
-
-	// AJR TODO -- passing a null OldIndex here will not work. figure it out
-	tuplesort = tuplesort_begin_cluster(origTupDesc, OldIndex,
-											maintenance_work_mem, NULL, false);
-
-}
-
-static void
-appendonly_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
-								 Relation OldIndex, bool use_sort,
-								 TransactionId OldestXmin,
-								 TransactionId *xid_cutoff,
-								 MultiXactId *multi_cutoff,
-								 double *num_tuples,
-								 double *tups_vacuumed,
-								 double *tups_recently_dead)
-{
-	TupleDesc	oldTupDesc;
-	TupleDesc	newTupDesc;
-	int			natts;
-	Datum	   *values;
-	bool	   *isnull;
-	TransactionId FreezeXid;
-	MultiXactId MultiXactCutoff;
-	Tuplesortstate *tuplesort;
-	PGRUsage	ru0;
-
+	TupleDesc				newTupDesc;
+	int						natts;
+	Datum					*values;
+	bool					*isnull;
+	TransactionId			FreezeXid;
+	MultiXactId				MultiXactCutoff;
 	AOTupleId				aoTupleId;
-	AppendOnlyInsertDesc	aoInsertDesc = NULL;
-	MemTupleBinding*		mt_bind = NULL;
 	int						write_seg_no;
-	MemTuple				mtuple = NULL;
-	TupleTableSlot		   *slot;
+	TupleTableSlot			*slot;
 	TableScanDesc			aoscandesc;
+
+	MemTupleBinding*		mt_bind = NULL;
+	MemTuple				mtuple = NULL;
+	AppendOnlyInsertDesc	aoInsertDesc = NULL;
 	double					n_tuples_written = 0;
-
-	pg_rusage_init(&ru0);
-
-	/*
-	 * Curently AO storage lacks cost model for IndexScan, thus IndexScan
-	 * is not functional. In future, probably, this will be fixed and CLUSTER
-	 * command will support this. Though, random IO over AO on TID stream
-	 * can be impractical anyway.
-	 * Here we are sorting data on on the lines of heap tables, build a tuple
-	 * sort state and sort the entire AO table using the index key, rewrite
-	 * the table, one tuple at a time, in order as returned by tuple sort state.
-	 */
-	if (OldIndex == NULL || !IS_BTREE(OldIndex))
-		ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("cannot cluster append-optimized table \"%s\"", RelationGetRelationName(OldHeap)),
-					errdetail("Append-optimized tables can only be clustered against a B-tree index")));
-
 	/*
 	 * Their tuple descriptors should be exactly alike, but here we only need
 	 * assume that they have the same number of columns.
 	 */
-	oldTupDesc = RelationGetDescr(OldHeap);
 	newTupDesc = RelationGetDescr(NewHeap);
 	Assert(newTupDesc->natts == oldTupDesc->natts);
 
@@ -1297,10 +1246,6 @@ appendonly_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	/* return selected values to caller */
 	*xid_cutoff = FreezeXid;
 	*multi_cutoff = MultiXactCutoff;
-
-	tuplesort = tuplesort_begin_cluster(oldTupDesc, OldIndex,
-											maintenance_work_mem, NULL, false);
-
 
 	/* Log what we're doing */
 	ereport(DEBUG2,
@@ -1424,6 +1369,88 @@ appendonly_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	/* Finish and deallocate insertion */
 	appendonly_insert_finish(aoInsertDesc);
 }
+
+static void
+appendonly_relation_copy_for_repack(Relation OldHeap, Relation NewHeap, 
+									int nkeys, AttrNumber *attNums, 
+									Oid *sortOperators, Oid *sortCollations,
+									bool *nullsFirstFlags, TransactionId *frozenXid,
+									MultiXactId *cutoffMulti, TransactionId OldestXmin,
+									double *num_tuples)
+{
+	PGRUsage		ru0;
+	TupleDesc		oldTupDesc;
+	Tuplesortstate	*tuplesort;
+
+	/* these are thrown away, just kept so we can share code with cluster */
+	double			tups_recently_dead = 0; 
+	double			tups_vacuumed = 0;
+
+	pg_rusage_init(&ru0);
+	oldTupDesc = RelationGetDescr(OldHeap);
+
+	// AJR TODO -- tuplesort_*_heap rourtines use MinimalTuple representation.
+	// I'm not clear what's discarded in that case, as opposed to a HeapTuple,
+	// so we may need to write our own tuplesort_begin_repack to tee this up
+	// more correctly.  Guess we'll see....
+	// We may be alright, because gpreload was doing CTAS inserts, and the
+	// sorting for those is done by heap-tuplesort.
+	tuplesort = tuplesort_begin_heap(
+		oldTupDesc,
+		nkeys, 
+		attNums,
+		sortOperators, 
+		sortCollations,
+		nullsFirstFlags,
+		maintenance_work_mem, 
+		NULL, 
+		false);
+
+	appendonly_relation_copy(OldHeap, NewHeap, oldTupDesc, OldestXmin, frozenXid,
+		cutoffMulti, num_tuples, &tups_vacuumed, &tups_recently_dead, tuplesort);
+}
+
+static void
+appendonly_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
+								 Relation OldIndex, bool use_sort,
+								 TransactionId OldestXmin,
+								 TransactionId *xid_cutoff,
+								 MultiXactId *multi_cutoff,
+								 double *num_tuples,
+								 double *tups_vacuumed,
+								 double *tups_recently_dead)
+{
+	TupleDesc	oldTupDesc;
+	Tuplesortstate *tuplesort;
+	PGRUsage	ru0;
+
+
+	pg_rusage_init(&ru0);
+
+	/*
+	 * Curently AO storage lacks cost model for IndexScan, thus IndexScan
+	 * is not functional. In future, probably, this will be fixed and CLUSTER
+	 * command will support this. Though, random IO over AO on TID stream
+	 * can be impractical anyway.
+	 * Here we are sorting data on on the lines of heap tables, build a tuple
+	 * sort state and sort the entire AO table using the index key, rewrite
+	 * the table, one tuple at a time, in order as returned by tuple sort state.
+	 */
+	if (OldIndex == NULL || !IS_BTREE(OldIndex))
+		ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot cluster append-optimized table \"%s\"", RelationGetRelationName(OldHeap)),
+					errdetail("Append-optimized tables can only be clustered against a B-tree index")));
+	
+	oldTupDesc = RelationGetDescr(OldHeap);
+	tuplesort = tuplesort_begin_cluster(oldTupDesc, OldIndex,
+											maintenance_work_mem, NULL, false);
+
+	appendonly_relation_copy(OldHeap, NewHeap, oldTupDesc, OldestXmin, xid_cutoff,
+		multi_cutoff, num_tuples, tups_vacuumed, tups_recently_dead, tuplesort);
+}
+
+
 
 static bool
 appendonly_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,

@@ -5917,7 +5917,7 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode)
 		 */
 		if (tab->rewrite & AT_REWRITE_REPACK)
 		{
-			ATRepackTable(OldHeap, tab); // AJR TODO --  adjust signature here.  
+			ATRepackTable(OldHeap, tab);
 			heap_close(OldHeap, NoLock);
 			continue;
 		}
@@ -17368,26 +17368,40 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 {
 	elog(WARNING, "AJR -- we landed in the repack function!");
 
-	Oid		accessMethod = origTable->rd_rel->relam;
-	Oid		origTableOid = RelationGetRelid(origTable);
-	Oid		tableSpace = origTable->rd_rel->reltablespace;
-	char	relpersistence = origTable->rd_rel->relpersistence;
-	double	num_tuples = 0;
-	double	tups_recently_dead = 0;
-	double	tups_vacuumed = 0;
-
-
+	AttrNumber		*attNums;
+	BlockNumber		num_pages;
+	Form_pg_class	relform;
+	HeapTuple		reltup;
+	ListCell		*cell;
 	MultiXactId		cutoffMulti;
+	Oid				*sortCollations;
+	Oid				*sortOperators;
 	Oid				newTableOid;
-	Relation		dummyIndex;
 	Relation		newTable;
+	Relation		relRelation;
 	TransactionId	OldestXmin;
 	TransactionId	frozenXid;
+	bool			*nullsFirstFlags;
+	int				keyNo;
+
+	Oid			accessMethod = origTable->rd_rel->relam;
+	Oid			origTableOid = RelationGetRelid(origTable);
+	Oid			tableSpace = origTable->rd_rel->reltablespace;
+	char		relpersistence = origTable->rd_rel->relpersistence;
+	double		num_tuples = 0;
 
 	/* 
-	 * Assume that origTable is an AO table, not a system relation, that a lock is held by
-	 * ATController, and that relation is already open.
+	 * ATPrepRepack already checked that origTable is an AO table, not a system
+	 * relation, that a lock is held by ATController, and that relation is 
+	 * already open.
 	 */ 
+
+	int nkeys = list_length(tab->repack_cols);
+	attNums = (AttrNumber *) palloc0(nkeys * sizeof(AttrNumber));
+	sortCollations = (Oid *) palloc0(nkeys * sizeof(Oid));
+	sortOperators = (Oid *) palloc0(nkeys * sizeof(Oid));
+	nullsFirstFlags = (bool *) palloc0(nkeys * sizeof(bool));
+	
 
 	/* Create the transient table that will receive the re-ordered data */
 	newTableOid = make_new_heap(origTableOid, tableSpace,
@@ -17404,48 +17418,141 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 	 */
 	newTable = table_open(newTableOid, AccessExclusiveLock);
 
+	// dummyIndex = dummy_index_create(origTable, tab->repack_cols);
 
-	// AJR TODO -- these steps already done in the ao AM handlers, so if we can re-use the copy for
-	// cluster code we don't need it here also
-	////////////////////////////////////////////////////
+
+	/* Extract per-column info from user-provided columns, store to usable structs */
+	keyNo = 0;
+	foreach(cell, tab->repack_cols)
+	{
+		Form_pg_attribute 	attTup;
+		Form_pg_opclass		opform;
+		HeapTuple			attHeapTup;
+		HeapTuple			opClassTup;
+		Oid					opClassId;
+		Oid					sortop;
+
+		ColumnDef *col = lfirst(cell);
+		/* Find and cast the column tuple so we can extract its required fields */
+		attHeapTup = SearchSysCacheAttName(RelationGetRelid(origTable), col->colname);
+		if (!HeapTupleIsValid(attHeapTup))
+			ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_COLUMN),
+			errmsg("column \"%s\" of relation \"%s\" does not exist",
+			col->colname, RelationGetRelationName(origTable))));
+
+		attTup = (Form_pg_attribute) GETSTRUCT(attHeapTup);
+		attNums[keyNo] = attTup->attnum;
+
+		if (OidIsValid(attTup->attcollation))
+			sortCollations[keyNo] = attTup->attcollation;
+		else
+			sortCollations[keyNo] = DEFAULT_COLLATION_OID;
+
+		/* retrieve opclass info for this column */
+		opClassId = GetDefaultOpClass(attTup->atttypid, origTable->rd_rel->relam);
+		if (opClassId == InvalidOid)
+			/* This should not be possible, but handle it just in case */
+			ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("column \"%s\" is of a type that cannot serve as a repacking key",
+				col->colname)));
+
+		opClassTup = SearchSysCache1(CLAOID, ObjectIdGetDatum(opClassId));
+		opform = (Form_pg_opclass) GETSTRUCT(opClassTup);
+
+		/* 
+		 * For the purposes of REPACK it does not matter if we put NULL values
+		 * first or last, as this will have the no impact on compression and
+		 * range scanning. Thus, to reduce code complexity and time spent on the
+		 * lookups, we arbitrarily put nulls last.
+		 *
+		 * Further, for the same reasons  it does not matter if we treat the sort as ascending or
+		 * descending, so we arbitrarily assign it to be ascending.
+		 */
+		nullsFirstFlags[keyNo] = false;
+		sortop = get_opfamily_member(
+			opform->opcfamily,
+			attTup->atttypid,
+			attTup->atttypid,
+			BTLessStrategyNumber);
+
+		if (sortop == InvalidOid)
+			/* This should not be possible, but handle it just in case */
+			ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("column \"%s\" is of a type that cannot serve as a repacking key",
+				col->colname)));
+
+		sortOperators[keyNo] = sortop;
+
+
+		ReleaseSysCache(attHeapTup);
+		ReleaseSysCache(opClassTup);
+		keyNo++;
+	}
+
 	/*
 	 * Compute xids used to freeze and weed out dead tuples and multixacts.
+	 * Since we're going to rewrite the whole table anyway, there's no reason
+	 * not to be aggressive about this.
 	 */
 	vacuum_set_xid_limits(origTable, 0, 0, 0, 0,
 						  &OldestXmin, &frozenXid, NULL, &cutoffMulti,
 						  NULL);
 
 	/*
-	 * frozenXid will become the table's new relfrozenxid, and that mustn't go
+	 * FreezeXid will become the table's new relfrozenxid, and that mustn't go
 	 * backwards, so take the max.
 	 */
 	if (TransactionIdIsValid(origTable->rd_rel->relfrozenxid) &&
 		TransactionIdPrecedes(frozenXid, origTable->rd_rel->relfrozenxid))
-		frozenXid = origTable->rd_rel->relfrozenxid;
+		frozenXid= origTable->rd_rel->relfrozenxid;
 
 	/*
-	 * cutoffMulti, similarly, shouldn't go backwards either.
+	 * MultiXactCutoff, similarly, shouldn't go backwards either.
 	 */
 	if (MultiXactIdIsValid(origTable->rd_rel->relminmxid) &&
 		MultiXactIdPrecedes(cutoffMulti, origTable->rd_rel->relminmxid))
 		cutoffMulti = origTable->rd_rel->relminmxid;
-	////////////////////////////////////////////////////
 
-	ereport(DEBUG2, // AJR TODO -- not sure what the best log level here is
-		(errmsg("repacking \"%s.%s\"",
-			get_namespace_name(RelationGetNamespace(origTable)),
-			RelationGetRelationName(origTable))));
 
-	dummyIndex = dummy_index_create(origTable, tab->repack_cols);
+	/* hand off to AM handler for actual copying*/
+	table_relation_copy_for_repack(origTable, newTable, 
+		nkeys, attNums, sortOperators, sortCollations,
+		nullsFirstFlags, &frozenXid, &cutoffMulti, OldestXmin, &num_tuples);
 
-	// table_relation_copy_for_repack(origTable, newTable);
-	table_relation_copy_for_cluster(origTable, newTable, dummyIndex, 
-									false, // use_sort is not used in AORO or AOCS AM routines
-									OldestXmin, &frozenXid, &cutoffMulti,
-									&num_tuples, &tups_vacuumed,
-									&tups_recently_dead);
 
-	/* Make the update visible */
+	/* Reset rd_toastoid just to be tidy --- it shouldn't be looked at again */
+	newTable->rd_toastoid = InvalidOid;
+
+	/* 
+	 * Make the update to the new table visible so we can capture some info
+	 * about it 
+	 */
+	CommandCounterIncrement();
+
+	num_pages = RelationGetNumberOfBlocks(newTable);
+
+	table_close(origTable, NoLock);
+	table_close(newTable, NoLock);
+
+	/* Update pg_class to reflect the correct values of pages and tuples. */
+	relRelation = table_open(RelationRelationId, RowExclusiveLock);
+
+	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(newTableOid));
+	if (!HeapTupleIsValid(reltup))
+		elog(ERROR, "cache lookup failed for relation %u", newTableOid);
+	relform = (Form_pg_class) GETSTRUCT(reltup);
+
+	relform->relpages = num_pages;
+	relform->reltuples = num_tuples;
+	CatalogTupleUpdate(relRelation, &reltup->t_self, reltup);
+
+	heap_freetuple(reltup);
+	table_close(relRelation, RowExclusiveLock);
+
+	/* Make the update to pg_class visible */
 	CommandCounterIncrement();
 
 	/*
@@ -17458,10 +17565,12 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 		true /* swap_stats */,
 		false, 
 		true,
-		frozenXid, cutoffMulti,
+		frozenXid,
+		cutoffMulti,
 		relpersistence);
-
-	// RelationCacheDelete(dummyIndex); // AJR TODO
+	
+	pfree(attNums);
+	pfree(sortCollations);
 }
 
 /*
