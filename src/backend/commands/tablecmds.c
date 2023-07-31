@@ -5220,14 +5220,21 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_RepackTable: /* GPDB: REPACK TABLE */
 			ATSimplePermissions(rel, ATT_TABLE);
 			ATSimpleRecursion(wqueue, rel, cmd, recurse, lockmode);
-
 			List *cols = (List *) cmd->def;
-
-			if (Gp_role == GP_ROLE_DISPATCH)
-				ATPrepRepack(rel, cols);
+			
+			/* deep copy list so its contents are available on executors*/
+			ListCell *cell;
+			tab->repack_cols = NIL;
+			foreach(cell, cols)
+			{
+				ColumnDef *col = lfirst(cell);
+				elog(WARNING, "AJR -- adding \"%s\" to column keys", col->colname);
+				tab->repack_cols = lappend(tab->repack_cols, pstrdup(col->colname));
+			}
+				
+			ATPrepRepack(rel, tab->repack_cols);
 
 			tab->rewrite |= AT_REWRITE_REPACK;
-			tab->repack_cols = cols; 
 			pass = AT_PASS_MISC;
 			break;
 		case AT_ExpandPartitionTablePrepare:
@@ -5918,7 +5925,6 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode)
 		if (tab->rewrite & AT_REWRITE_REPACK)
 		{
 			ATRepackTable(OldHeap, tab);
-			heap_close(OldHeap, NoLock);
 			continue;
 		}
 
@@ -17366,7 +17372,6 @@ ATExecExpandTableCTAS(AlterTableCmd *rootCmd, Relation rel, AlterTableCmd *cmd)
 static void
 ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 {
-	elog(WARNING, "AJR -- we landed in the repack function!");
 
 	AttrNumber		*attNums;
 	BlockNumber		num_pages;
@@ -17378,7 +17383,7 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 	Oid				*sortOperators;
 	Oid				newTableOid;
 	Relation		newTable;
-	Relation		relRelation;
+	Relation		pgClassRelation;
 	TransactionId	OldestXmin;
 	TransactionId	frozenXid;
 	bool			*nullsFirstFlags;
@@ -17397,6 +17402,7 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 	 */ 
 
 	int nkeys = list_length(tab->repack_cols);
+	elog(WARNING, "AJR -- we landed in the repack function, with nkeys=%d", nkeys);
 	attNums = (AttrNumber *) palloc0(nkeys * sizeof(AttrNumber));
 	sortCollations = (Oid *) palloc0(nkeys * sizeof(Oid));
 	sortOperators = (Oid *) palloc0(nkeys * sizeof(Oid));
@@ -17420,7 +17426,6 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 
 	// dummyIndex = dummy_index_create(origTable, tab->repack_cols);
 
-
 	/* Extract per-column info from user-provided columns, store to usable structs */
 	keyNo = 0;
 	foreach(cell, tab->repack_cols)
@@ -17432,15 +17437,9 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 		Oid					opClassId;
 		Oid					sortop;
 
-		ColumnDef *col = lfirst(cell);
+		char *colname = lfirst(cell);
 		/* Find and cast the column tuple so we can extract its required fields */
-		attHeapTup = SearchSysCacheAttName(RelationGetRelid(origTable), col->colname);
-		if (!HeapTupleIsValid(attHeapTup))
-			ereport(ERROR,
-			(errcode(ERRCODE_UNDEFINED_COLUMN),
-			errmsg("column \"%s\" of relation \"%s\" does not exist",
-			col->colname, RelationGetRelationName(origTable))));
-
+		attHeapTup = SearchSysCacheAttName(RelationGetRelid(origTable), colname);
 		attTup = (Form_pg_attribute) GETSTRUCT(attHeapTup);
 		attNums[keyNo] = attTup->attnum;
 
@@ -17450,13 +17449,13 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 			sortCollations[keyNo] = DEFAULT_COLLATION_OID;
 
 		/* retrieve opclass info for this column */
-		opClassId = GetDefaultOpClass(attTup->atttypid, origTable->rd_rel->relam);
+		opClassId = GetDefaultOpClass(attTup->atttypid, BTREE_AM_OID); // AJR TODO -- hardcoding BTREE for now, but check what the correct approach here is
 		if (opClassId == InvalidOid)
 			/* This should not be possible, but handle it just in case */
 			ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("column \"%s\" is of a type that cannot serve as a repacking key",
-				col->colname)));
+				colname)));
 
 		opClassTup = SearchSysCache1(CLAOID, ObjectIdGetDatum(opClassId));
 		opform = (Form_pg_opclass) GETSTRUCT(opClassTup);
@@ -17467,7 +17466,7 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 		 * range scanning. Thus, to reduce code complexity and time spent on the
 		 * lookups, we arbitrarily put nulls last.
 		 *
-		 * Further, for the same reasons  it does not matter if we treat the sort as ascending or
+		 * Further, for the same reasons it does not matter if we treat the sort as ascending or
 		 * descending, so we arbitrarily assign it to be ascending.
 		 */
 		nullsFirstFlags[keyNo] = false;
@@ -17482,10 +17481,9 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 			ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("column \"%s\" is of a type that cannot serve as a repacking key",
-				col->colname)));
+				colname)));
 
 		sortOperators[keyNo] = sortop;
-
 
 		ReleaseSysCache(attHeapTup);
 		ReleaseSysCache(opClassTup);
@@ -17538,7 +17536,7 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 	table_close(newTable, NoLock);
 
 	/* Update pg_class to reflect the correct values of pages and tuples. */
-	relRelation = table_open(RelationRelationId, RowExclusiveLock);
+	pgClassRelation = table_open(RelationRelationId, RowExclusiveLock);
 
 	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(newTableOid));
 	if (!HeapTupleIsValid(reltup))
@@ -17547,10 +17545,10 @@ ATRepackTable(Relation origTable, AlteredTableInfo *tab)
 
 	relform->relpages = num_pages;
 	relform->reltuples = num_tuples;
-	CatalogTupleUpdate(relRelation, &reltup->t_self, reltup);
+	CatalogTupleUpdate(pgClassRelation, &reltup->t_self, reltup);
 
 	heap_freetuple(reltup);
-	table_close(relRelation, RowExclusiveLock);
+	table_close(pgClassRelation, RowExclusiveLock);
 
 	/* Make the update to pg_class visible */
 	CommandCounterIncrement();
@@ -18936,6 +18934,13 @@ ATPrepRepack(Relation rel, List * cols)
 				 errmsg("cannot repack table without at least one COLUMN specified"),
 				 errtable(rel)));
 
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot repack table \"%s\" because it is temporary",
+							RelationGetRelationName(rel)),
+					 errtable(rel)));
+
 	/*
 	 * Check whether relation is an appendonly table. If not, hard-fail the
 	 * statement.
@@ -18963,26 +18968,29 @@ ATPrepRepack(Relation rel, List * cols)
 				foundCompression = true;
 		}
 	}
-	/* 
-	 * If we have not already fired a warning for the table, do a column level check for AOCO
-	 * tables, to check that all columns are compressed
-	 */
-	if (!foundCompression && RelationIsAoCols(rel))
+
+	foreach(cell, cols)
 	{
-		foreach(cell, cols)
-		{
-			ColumnDef *col = lfirst(cell);
-			// AJR TODO -- where do we store column level compression info?
-			// it is in pg_attribute_encoding, look up how to retrieve that from here
-			ereport(WARNING,
-					(errmsg("AJR -- we have found column: \"%s\"",
-							col->colname)));
-		}
+		HeapTuple attHeapTup;
+
+		char *colname = lfirst(cell);
+		attHeapTup = SearchSysCacheAttName(RelationGetRelid(rel), colname);
+		if (!HeapTupleIsValid(attHeapTup))
+			ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_COLUMN),
+			errmsg("column \"%s\" of relation \"%s\" does not exist",
+			colname, RelationGetRelationName(rel))));
+		
+		// AJR TODO -- where do we store column level compression info?
+		// it is in pg_attribute_encoding, look up how to retrieve that from here
+		// then check if we're doing AOCS and check the column-level
+		// compression encoding
+		ReleaseSysCache(attHeapTup);
 	}
 
 	if (!foundCompression)
 	{
-		ereport(NOTICE,
+		ereport(WARNING,
 				(errmsg("table \"%s\" is not compressed",
 						RelationGetRelationName(rel)),
 				errdetail("repacking this table will not reduce disk space usage")));

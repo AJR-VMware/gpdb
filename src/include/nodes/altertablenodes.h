@@ -86,7 +86,7 @@ typedef struct AlteredTableInfo
 	char	   *replicaIdentityIndex;	/* index to reset as REPLICA IDENTITY */
 	char	   *clusterOnIndex;	/* index to use for CLUSTER */
 	List       *new_crsds; /* new column reference storage directives */
-	List	   *repack_cols; /* List of ColumnDefs for REPACK */
+	List	   *repack_cols; /* List of char* column names for REPACK */
 } AlteredTableInfo;
 
 /* Struct describing one new constraint to check in Phase 3 scan */

@@ -1389,13 +1389,7 @@ appendonly_relation_copy_for_repack(Relation OldHeap, Relation NewHeap,
 	pg_rusage_init(&ru0);
 	oldTupDesc = RelationGetDescr(OldHeap);
 
-	// AJR TODO -- tuplesort_*_heap rourtines use MinimalTuple representation.
-	// I'm not clear what's discarded in that case, as opposed to a HeapTuple,
-	// so we may need to write our own tuplesort_begin_repack to tee this up
-	// more correctly.  Guess we'll see....
-	// We may be alright, because gpreload was doing CTAS inserts, and the
-	// sorting for those is done by heap-tuplesort.
-	tuplesort = tuplesort_begin_heap(
+	tuplesort = tuplesort_begin_repack(
 		oldTupDesc,
 		nkeys, 
 		attNums,
